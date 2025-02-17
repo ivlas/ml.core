@@ -1,9 +1,7 @@
 # ml.core
 
-## Original resources
-
-- [course website](https://karpathy.ai/zero-to-hero.html)
-- [youtube playlist](https://www.youtube.com/playlist?list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ)
+> [course website](https://karpathy.ai/zero-to-hero.html) \
+> [youtube playlist](https://www.youtube.com/playlist?list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ)
 
 ## Overview
 
