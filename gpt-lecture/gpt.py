@@ -54,14 +54,51 @@ def train(model, optimizer, max_iters=100, eval_iters=10):
         loss.backward()
         optimizer.step()
 
-class BigramLM(nn.Module):
-
-    def __init__(self, VOCAB_SIZE):
+class Head(nn.Module):
+    
+    def __init__(self, head_size, n_embd, block_size):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(VOCAB_SIZE, VOCAB_SIZE)
+        self.head_size = head_size
+        self.n_embd = n_embd
+        self.block_size = block_size
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x) # (B, T, C)
+        q = self.query(x) # (B, T, C)
+
+        # Compute the attention (affinity) scores between the queries and keys
+        wei = q @ k.transpose(-2, -1) * self.head_size**(-0.5) # (B, T, C) @ (B, C, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+
+        # Perform the weighted aggregation of the values
+        v = self.value(x) # (B, T, C)
+        out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
+        return out
+
+class GPTLM(nn.Module):
+
+    def __init__(self, block_size, vocab_size, n_embd):
+        super().__init__()
+        self.block_size = block_size
+        self.vocab_size = vocab_size
+        self.n_embd = n_embd
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.self_attention_head = Head(n_embd, n_embd, block_size)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
     
     def forward(self, idx, targets=None):
-        logits = self.token_embedding_table(idx) 
+        token_embedding = self.token_embedding_table(idx) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
+        position_embedding = self.position_embedding_table(torch.arange(idx.shape[1], device=idx.device)) # (BLOCK_SIZE, N_EMBD)
+        x = token_embedding + position_embedding # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
+        x = self.self_attention_head(x) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
+        logits = self.lm_head(token_embedding) # (BATCH_SIZE, BLOCK_SIZE, VOCAB_SIZE)
         
         if targets is None:
             loss = None
@@ -76,6 +113,7 @@ class BigramLM(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx: (BATCH_SIZE, BLOCK_SIZE) arrays of indices in the current context
         for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.block_size:] # crop idx to the last block_size tokens
             logits, loss = self(idx) # get the predictions
             logits = logits[:, -1, :] # becomes (BATCH_SIZE, VOCAB_SIZE)
             probs = F.softmax(logits, dim=-1) # apply softmax to get probabilities
@@ -88,14 +126,15 @@ if __name__ == '__main__':
     # Hyperparameters
     BATCH_SIZE = 128
     BLOCK_SIZE = 8
-    MAX_ITERS = 10_000
+    N_EMBD = 32
+    MAX_ITERS = 500
     EVAL_ITERS = MAX_ITERS // 100
-    LEARNING_RATE = 0.0015
+    LEARNING_RATE = 0.00025
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
 
     torch.manual_seed(42)
 
-    ROOT = Path(__file__).parents[2]
+    ROOT = Path(__file__).parents[1]
     DATA_PATH = ROOT / 'data' / 'shakespeare.txt'
     with open(DATA_PATH, 'r') as f:
         text = f.read()
@@ -110,7 +149,12 @@ if __name__ == '__main__':
     data = torch.tensor(encode(text), dtype=torch.long, device=DEVICE)
     train_data, val_data = split_data(data, device=DEVICE)
 
-    model = BigramLM(VOCAB_SIZE).to(DEVICE)
+    model = GPTLM(
+        block_size=BLOCK_SIZE,
+        vocab_size=VOCAB_SIZE,
+        n_embd=N_EMBD
+    ).to(DEVICE)
+
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     train(model, optimizer, max_iters=MAX_ITERS, eval_iters=EVAL_ITERS)
