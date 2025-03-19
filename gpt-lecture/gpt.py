@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn import functional as F
+import time
 
 def get_batch(split):
     match split:
@@ -38,12 +39,18 @@ def estimate_loss(model, eval_iters=100):
 
 def train(model, optimizer, max_iters=100, eval_iters=10):
 
+    start_time = time.time()
+
     for iter in range(max_iters):
 
         # every once in a while, estimate the loss on the training and validation sets
-        if iter % EVAL_ITERS == 0:
+        if iter % eval_iters == 0:
             losses = estimate_loss(model, eval_iters=eval_iters)
+            elapsed_time = time.time() - start_time
+            estimated_total_time = elapsed_time / (iter + 1) * max_iters
+            remaining_time = estimated_total_time - elapsed_time
             print(f'Epoch:\t{iter}, Train loss: {losses["train"]:.3f}, Val loss: {losses["val"]:.3f}')
+            print(f'Elapsed time: {elapsed_time:.2f}s, Estimated total time: {estimated_total_time:.2f}s, Remaining time: {remaining_time:.2f}s')
 
         # sample a batch of data
         Xb, Yb = get_batch('train')
@@ -56,7 +63,7 @@ def train(model, optimizer, max_iters=100, eval_iters=10):
 
 class Head(nn.Module):
     
-    def __init__(self, head_size, n_embd, block_size):
+    def __init__(self, head_size, n_embd, block_size, dropout):
         super().__init__()
         self.head_size = head_size
         self.n_embd = n_embd
@@ -64,6 +71,7 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
@@ -75,29 +83,80 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * self.head_size**(-0.5) # (B, T, C) @ (B, C, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
 
         # Perform the weighted aggregation of the values
         v = self.value(x) # (B, T, C)
         out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
         return out
 
+
+class MultiHeadAttention(nn.Module):
+    
+    def __init__(self, n_heads, head_size, n_embd, block_size, dropout):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size, n_embd, block_size, dropout) for _ in range(n_heads)])
+        self.projection = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        out = torch.cat([head(x) for head in self.heads], dim=-1)
+        out = self.dropout(self.projection(out))
+        return out
+
+    
+
+class FeedForward(nn.Module):
+
+    def __init__(self, n_embd, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+
+    def __init__(self, n_head, n_embd, block_size, dropout):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.self_attention = MultiHeadAttention(n_head, head_size, n_embd, block_size, dropout) # i.e. 4 heads of 8-dimensional self-attention
+        self.ffwd = FeedForward(n_embd, dropout)
+        self.layernorm_1 = nn.LayerNorm(n_embd)
+        self.layernorm_2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.self_attention(self.layernorm_1(x)) # Residual connection
+        x = x + self.ffwd(self.layernorm_2(x)) # Residual connection
+        return x
+
+
 class GPTLM(nn.Module):
 
-    def __init__(self, block_size, vocab_size, n_embd):
+    def __init__(self, block_size, vocab_size, n_embd, n_head, n_layer, dropout=0.2):
         super().__init__()
         self.block_size = block_size
         self.vocab_size = vocab_size
         self.n_embd = n_embd
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.self_attention_head = Head(n_embd, n_embd, block_size)
+        self.blocks = nn.Sequential(
+            *[Block(n_head, n_embd, block_size, dropout) for _ in range(n_layer)],
+            nn.LayerNorm(n_embd),
+        )
         self.lm_head = nn.Linear(n_embd, vocab_size)
     
     def forward(self, idx, targets=None):
         token_embedding = self.token_embedding_table(idx) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
         position_embedding = self.position_embedding_table(torch.arange(idx.shape[1], device=idx.device)) # (BLOCK_SIZE, N_EMBD)
         x = token_embedding + position_embedding # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
-        x = self.self_attention_head(x) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
+        x = self.blocks(x) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
         logits = self.lm_head(token_embedding) # (BATCH_SIZE, BLOCK_SIZE, VOCAB_SIZE)
         
         if targets is None:
@@ -114,7 +173,7 @@ class GPTLM(nn.Module):
         # idx: (BATCH_SIZE, BLOCK_SIZE) arrays of indices in the current context
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:] # crop idx to the last block_size tokens
-            logits, loss = self(idx) # get the predictions
+            logits, loss = self(idx_cond) # get the predictions
             logits = logits[:, -1, :] # becomes (BATCH_SIZE, VOCAB_SIZE)
             probs = F.softmax(logits, dim=-1) # apply softmax to get probabilities
             idx_next = torch.multinomial(probs, num_samples=1) # sample from the distribution
@@ -124,12 +183,15 @@ class GPTLM(nn.Module):
 if __name__ == '__main__':
 
     # Hyperparameters
-    BATCH_SIZE = 128
-    BLOCK_SIZE = 8
-    N_EMBD = 32
-    MAX_ITERS = 500
+    BATCH_SIZE = 32
+    BLOCK_SIZE = 128
+    N_EMBD = 16
+    MAX_ITERS = 10_000
     EVAL_ITERS = MAX_ITERS // 100
-    LEARNING_RATE = 0.00025
+    LEARNING_RATE = 5e-4
+    N_HEAD = 4
+    N_LAYER = 4
+    DROPOUT = 0.2
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
 
     torch.manual_seed(42)
@@ -152,18 +214,18 @@ if __name__ == '__main__':
     model = GPTLM(
         block_size=BLOCK_SIZE,
         vocab_size=VOCAB_SIZE,
-        n_embd=N_EMBD
+        n_embd=N_EMBD,
+        n_head=N_HEAD,
+        n_layer=N_LAYER,
+        dropout=DROPOUT,
     ).to(DEVICE)
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    print(f'Number of parameters: {sum(p.numel() for p in model.parameters())}')
 
     train(model, optimizer, max_iters=MAX_ITERS, eval_iters=EVAL_ITERS)
 
     # generate from the model
     context = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)
     print(f'Generated text: {decode(model.generate(context, max_new_tokens=500)[0].tolist())}')
-
-
-
-
-
