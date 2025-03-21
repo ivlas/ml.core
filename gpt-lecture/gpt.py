@@ -193,6 +193,7 @@ if __name__ == '__main__':
     N_LAYER = 4
     DROPOUT = 0.2
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
+    print(f'Using device: {DEVICE}')
 
     torch.manual_seed(42)
 
