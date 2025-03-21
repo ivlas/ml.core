@@ -1,10 +1,13 @@
 from pathlib import Path
+import os
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn import functional as F
 import time
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
 
 def get_batch(split):
     match split:
@@ -15,6 +18,7 @@ def get_batch(split):
     ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,)) # Randomly select starting indices for sequences
     x = torch.stack([data[i:i+BLOCK_SIZE] for i in ix]) # Extract input sequences (x) from those indices and stack them
     y = torch.stack([data[i+1:i+BLOCK_SIZE+1] for i in ix]) # Extract target sequences (y) with +1 offset (next character prediction) and stack them
+    x, y = x.to(DEVICE), y.to(DEVICE)
     return x, y
 
 def split_data(data, train_frac=0.9, val_frac=0.1, device='cpu'):
@@ -57,9 +61,11 @@ def train(model, optimizer, max_iters=100, eval_iters=10):
 
         # evaluate the loss
         logits, loss = model(Xb, Yb)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+
+    return model
 
 class Head(nn.Module):
     
@@ -75,19 +81,21 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
+        # Input of size (batch, time-step, channels)
+        # Output of size (batch, time-step, head size)
         B, T, C = x.shape
-        k = self.key(x) # (B, T, C)
-        q = self.query(x) # (B, T, C)
+        k = self.key(x) # (B, T, head_size)
+        q = self.query(x) # (B, T, head_size)
 
         # Compute the attention (affinity) scores between the queries and keys
-        wei = q @ k.transpose(-2, -1) * self.head_size**(-0.5) # (B, T, C) @ (B, C, T) -> (B, T, T)
+        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
 
         # Perform the weighted aggregation of the values
-        v = self.value(x) # (B, T, C)
-        out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
+        v = self.value(x) # (B, T, head_size)
+        out = wei @ v # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
         return out
 
 
@@ -96,7 +104,7 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_heads, head_size, n_embd, block_size, dropout):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size, n_embd, block_size, dropout) for _ in range(n_heads)])
-        self.projection = nn.Linear(n_embd, n_embd)
+        self.projection = nn.Linear(head_size * n_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
@@ -104,7 +112,6 @@ class MultiHeadAttention(nn.Module):
         out = self.dropout(self.projection(out))
         return out
 
-    
 
 class FeedForward(nn.Module):
 
@@ -146,17 +153,26 @@ class GPTLM(nn.Module):
         self.n_embd = n_embd
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(
-            *[Block(n_head, n_embd, block_size, dropout) for _ in range(n_layer)],
-            nn.LayerNorm(n_embd),
-        )
+        self.blocks = nn.Sequential(*[Block(n_head, n_embd, block_size, dropout) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
+
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, idx, targets=None):
         token_embedding = self.token_embedding_table(idx) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
         position_embedding = self.position_embedding_table(torch.arange(idx.shape[1], device=idx.device)) # (BLOCK_SIZE, N_EMBD)
         x = token_embedding + position_embedding # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
         x = self.blocks(x) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
+        x = self.ln_f(x) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
         logits = self.lm_head(token_embedding) # (BATCH_SIZE, BLOCK_SIZE, VOCAB_SIZE)
         
         if targets is None:
@@ -192,7 +208,6 @@ if __name__ == '__main__':
     N_HEAD = 4
     N_LAYER = 4
     DROPOUT = 0.2
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
     print(f'Using device: {DEVICE}')
 
     torch.manual_seed(42)
@@ -221,11 +236,15 @@ if __name__ == '__main__':
         dropout=DROPOUT,
     ).to(DEVICE)
 
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     print(f'Number of parameters: {sum(p.numel() for p in model.parameters())}')
 
-    train(model, optimizer, max_iters=MAX_ITERS, eval_iters=EVAL_ITERS)
+    checkpoint = train(model, optimizer, max_iters=MAX_ITERS, eval_iters=EVAL_ITERS)
+
+    # Save the model
+    os.makedirs(ROOT / 'models', exist_ok=True)
+    torch.save(model.state_dict(), ROOT / 'models' / 'checkpoint.pth')
 
     # generate from the model
     context = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)
