@@ -173,7 +173,7 @@ class GPTLM(nn.Module):
         x = token_embedding + position_embedding # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
         x = self.blocks(x) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
         x = self.ln_f(x) # (BATCH_SIZE, BLOCK_SIZE, N_EMBD)
-        logits = self.lm_head(token_embedding) # (BATCH_SIZE, BLOCK_SIZE, VOCAB_SIZE)
+        logits = self.lm_head(x) # (BATCH_SIZE, BLOCK_SIZE, VOCAB_SIZE)
         
         if targets is None:
             loss = None
